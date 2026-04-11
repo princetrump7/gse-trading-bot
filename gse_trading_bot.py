@@ -863,7 +863,13 @@ def main() -> int:
 
     # ── Telegram ──────────────────────────────────────────────────────────
     tg = TelegramClient(token=BOT_TOKEN, chat_id=CHAT_ID)
-    tg.validate()
+    if tg.validate():
+        tg.send(
+            "🤖 <b>Dual-Market Bot Started</b>\n"
+            f"Monitoring: 🇬🇭 GSE + 🇺🇸 US\n"
+            f"Watchlist: {len(US_WATCHLIST)} US stocks\n"
+            "Scanning markets..."
+        )
 
     # ── State ─────────────────────────────────────────────────────────────
     saved = load_state()
