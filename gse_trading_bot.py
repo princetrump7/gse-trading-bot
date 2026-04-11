@@ -652,6 +652,7 @@ class TelegramClient:
             return False
 
     def _token_ok(self) -> bool:
+        """Telegram bot tokens are always '<numeric_bot_id>:<secret>' from @BotFather."""
         parts = (self.token or "").split(":", 1)
         return len(parts) == 2 and parts[0].isdigit() and len(parts[1]) >= 25
 
