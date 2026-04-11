@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.cursor/
+*.log
+learn/
+debug-*.log

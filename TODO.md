@@ -20,12 +20,10 @@ Current Working Directory: c:/Users/princ/OneDrive/Desktop/trials
 ### 5. Create Workflow ✓
 - `.github/workflows/gse-bot.yml` created (runs every 10min or manual, nohup python, 6h max).
 
-### 6. Push Changes
+### 6. Push Changes ✓
+- Committed workflow + script edit (`cb9c490`).
 
-### 6. Push Changes
-- `git add .`
-- `git commit -m "Add GitHub Actions workflow"`
-- `git push`
+### 7. Create Remote Repo & Push
 
 ### 7. Run Bot
 - Go to repo Actions tab, run 'gse-bot' workflow manually.
