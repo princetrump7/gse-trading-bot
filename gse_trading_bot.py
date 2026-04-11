@@ -9,6 +9,7 @@ Per-run lifecycle:
   4. Send EOD summary for markets that just closed
   5. Save updated state → bot_state.json
   6. Exit
+  
 """
 
 from __future__ import annotations
@@ -939,9 +940,9 @@ def main() -> int:
 
     # ── Process Telegram commands ───────────────────────────────────────
     custom_watchlist: list[str] = saved.get("custom_watchlist", [])
-    if tg._ready and custom_watchlist:
-        updates = tg.get_updates()
-        last_update_id = 0
+    last_update_id: int = saved.get("last_telegram_update_id", 0)
+    if tg._ready:
+        updates = tg.get_updates(last_update_id)
         for update in updates:
             last_update_id = update.get("update_id", 0) + 1
             msg = (update.get("message") or {}).get("text", "")
@@ -950,8 +951,7 @@ def main() -> int:
                 resp = tg.handle_command(msg, custom_watchlist)
                 if resp:
                     tg.send(resp)
-        if last_update_id:
-            tg.get_updates(offset=last_update_id)
+        saved["last_telegram_update_id"] = last_update_id
         saved["custom_watchlist"] = custom_watchlist
 
     # ── Determine open / closed markets ───────────────────────────────────
