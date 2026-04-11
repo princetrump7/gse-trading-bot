@@ -14,11 +14,13 @@ Current Working Directory: c:/Users/princ/OneDrive/Desktop/trials
 ### 3. Create Repo & Push
 - `gh repo create gse-trading-bot --public --push --source=. --remote=origin`
 
-### 4. Edit Script for GitHub Actions
-- Add env check to suppress startup Telegram msg in Actions.
+### 4. Edit Script for GitHub Actions ✓
+- Added `if os.getenv('GITHUB_ACTIONS') != 'true':` around startup msg.
 
-### 5. Create Workflow
-- Create `.github/workflows/bot.yml`
+### 5. Create Workflow ✓
+- `.github/workflows/gse-bot.yml` created (runs every 10min or manual, nohup python, 6h max).
+
+### 6. Push Changes
 
 ### 6. Push Changes
 - `git add .`

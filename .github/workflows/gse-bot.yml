@@ -1,0 +1,33 @@
+name: GSE Trading Bot 24/7
+
+on:
+  workflow_dispatch: # Manual trigger for persistence
+  schedule:
+    - cron: '*/10 * * * *' # Every 10 min (aligns with POLL_INTERVAL)
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+          
+      - name: Run GSE Trading Bot
+        run: |
+          echo 'GITHUB_ACTIONS=true'
+          nohup python gse_trading_bot.py > bot.log 2>&1 &
+          BOT_PID=$!
+          echo "Bot PID: $BOT_PID"
+          # Dummy wait for 6h max job time (restart manually for 24/7)
+          sleep 21600
+        env:
+          GITHUB_ACTIONS: true
