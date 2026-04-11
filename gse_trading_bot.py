@@ -27,6 +27,16 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 import requests
+from pathlib import Path
+
+# Load .env if present
+_env = Path(__file__).parent / ".env"
+if _env.exists():
+    for line in _env.read_text().strip().splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            if os.getenv(k) is None:
+                os.environ[k] = v
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Logging
