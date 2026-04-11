@@ -68,7 +68,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: bot_state.json
-          key: gse-state-${{ runner.os }}-${{ env.TODAY }}
+          key: gse-state-${{ runner.os }}-$(date -u +%Y-%m-%d)
           restore-keys: |
             gse-state-${{ runner.os }}-
 
