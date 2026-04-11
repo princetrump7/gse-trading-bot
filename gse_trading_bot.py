@@ -1,434 +1,889 @@
-import sys
-import logging
-import time
+"""
+Dual-Market Trading Bot — Ghana Stock Exchange (GSE) + US Markets
+Designed for ephemeral GitHub Actions runs with JSON state persistence.
+
+Per-run lifecycle:
+  1. Load state from bot_state.json (persisted via actions/cache)
+  2. Validate Telegram
+  3. Scan any open markets
+  4. Send EOD summary for markets that just closed
+  5. Save updated state → bot_state.json
+  6. Exit
+"""
+
+from __future__ import annotations
+
 import json
+import logging
+import math
 import os
-from datetime import datetime, time as dtime
-from html import escape as html_escape
-from typing import Any
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from enum import Enum, auto
+from pathlib import Path
+from typing import Any, Iterator
+from zoneinfo import ZoneInfo
 
 import requests
 
-# --- LOGGING SETUP ---
+# ══════════════════════════════════════════════════════════════════════════════
+# Logging
+# ══════════════════════════════════════════════════════════════════════════════
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("dualbot")
 
-# --- CONFIGURATION ---
-# NOTE: Keeping these hardcoded per your preference. Consider moving to environment variables later.
-BOT_TOKEN = "8742412969:AAF6IcaSQ2KMfX3ZYiIh9XPgbgWzN-NTWyQ"
-# Your Telegram user id or group id — not the bot id (same number as in BOT_TOKEN prefix will 403).
-CHAT_ID = "1751325678"
+# ══════════════════════════════════════════════════════════════════════════════
+# Configuration — all secrets via env-vars, fallbacks for local dev only
+# ══════════════════════════════════════════════════════════════════════════════
 
-GSE_LIVE_URL = "https://dev.kwayisi.org/apis/gse/live"
-SCORE_THRESHOLD = 10.0
-POLL_INTERVAL_SECONDS = 600  # 10 minutes
+BOT_TOKEN: str = os.getenv("TG_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+CHAT_ID:   str = os.getenv("TG_CHAT_ID",   "YOUR_CHAT_ID_HERE")
+DEBUG_MODE: bool = os.getenv("BOT_DEBUG", "0") == "1"
+FORCE_SCAN: bool = os.getenv("FORCE_SCAN", "no").lower() == "yes"
+STATE_FILE: Path = Path(os.getenv("STATE_FILE", "bot_state.json"))
+STATE_VERSION = 3
 
-market_memory = {}
-first_scan_complete = False
-alerted_today = set()
+# US tickers to monitor — extend freely
+US_WATCHLIST: list[str] = [
+    # Mega-cap
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "BRK-B",
+    # Finance
+    "JPM", "GS", "BAC", "V", "MA",
+    # Energy
+    "XOM", "CVX",
+    # Healthcare
+    "JNJ", "UNH",
+    # ETFs
+    "SPY", "QQQ", "IWM", "GLD", "SLV",
+    # High-beta / growth
+    "AMD", "PLTR", "SHOP", "COIN", "MSTR",
+]
 
-# Set True only after getMe succeeds at startup (invalid BOT_TOKEN → stays False).
-TELEGRAM_ENABLED = False
-# False when CHAT_ID equals the bot's own id (Telegram returns 403: bots can't message bots).
-TELEGRAM_SEND_OK = True
+# ══════════════════════════════════════════════════════════════════════════════
+# Enumerations
+# ══════════════════════════════════════════════════════════════════════════════
 
-DEBUG_LOG_PATH = os.path.join(os.path.dirname(__file__), "debug-5ad608.log")
-
-
-def bot_token_looks_valid(token: str) -> bool:
-    """Telegram bot tokens are always '<numeric_bot_id>:<secret>' from @BotFather."""
-    if not isinstance(token, str):
-        return False
-    parts = token.split(":", 1)
-    if len(parts) != 2:
-        return False
-    bot_id, secret = parts
-    if not bot_id.isdigit() or not secret:
-        return False
-    return len(secret) >= 25
-
-
-def debug_ndjson_log(
-    hypothesis_id: str,
-    location: str,
-    message: str,
-    data: dict[str, Any] | None = None,
-    *,
-    run_id: str = "debug",
-) -> None:
-    """Append a single NDJSON debug event for the debug-mode workflow."""
-    payload: dict[str, Any] = {
-        "sessionId": "5ad608",
-        "id": f"log_{time.time_ns()}",
-        "timestamp": int(time.time() * 1000),
-        "location": location,
-        "message": message,
-        "data": data or {},
-        "runId": run_id,
-        "hypothesisId": hypothesis_id,
-    }
-    try:
-        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        # Never let debug logging break the bot.
-        pass
+class MarketID(Enum):
+    GSE = auto()
+    US  = auto()
 
 
-def send_telegram_msg(message: str) -> bool:
-    """Send a message via Telegram bot API."""
-    if not TELEGRAM_ENABLED or not TELEGRAM_SEND_OK:
-        return False
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
-    #region agent log
-    debug_ndjson_log(
-        hypothesis_id="TG_SEND_1",
-        location="gse_trading_bot.py:send_telegram_msg:before_request",
-        message="Sending Telegram sendMessage request",
-        data={"parse_mode": payload.get("parse_mode"), "chat_id_len": len(str(CHAT_ID))},
-    )
-    #endregion
-    try:
-        r = requests.post(url, data=payload, timeout=10)
-        if r.status_code != 200:
-            logger.error("Telegram API error %d: %s", r.status_code, r.text)
-            #region agent log
-            debug_ndjson_log(
-                hypothesis_id="TG_SEND_1",
-                location="gse_trading_bot.py:send_telegram_msg:after_response_error",
-                message="Telegram sendMessage failed",
-                data={"status_code": r.status_code, "response_prefix": r.text[:200]},
-            )
-            #endregion
-            return False
-        #region agent log
-        debug_ndjson_log(
-            hypothesis_id="TG_SEND_2",
-            location="gse_trading_bot.py:send_telegram_msg:after_response_ok",
-            message="Telegram sendMessage succeeded",
-            data={"status_code": r.status_code},
-        )
-        #endregion
-        return True
-    except requests.RequestException as e:
-        logger.error("Telegram send failed: %s", e)
-        #region agent log
-        debug_ndjson_log(
-            hypothesis_id="TG_SEND_3",
-            location="gse_trading_bot.py:send_telegram_msg:exception",
-            message="Telegram request exception",
-            data={"error": str(e)[:200]},
-        )
-        #endregion
-        return False
+class SignalType(Enum):
+    BREAKOUT     = "Breakout"
+    ACCUMULATION = "Accumulation"
+    MOMENTUM     = "Momentum"
+    REVERSAL     = "Reversal"
+    NONE         = "None"
 
 
-def get_live_gse_data() -> list[dict]:
-    """Fetch live stock data from GSE API."""
-    # Retry once for transient failures (timeouts/5xx)
-    for attempt in range(2):
-        try:
-            response = requests.get(GSE_LIVE_URL, timeout=10)
-            response.raise_for_status()
-            data = response.json()
+# ══════════════════════════════════════════════════════════════════════════════
+# Shared HTTP session
+# ══════════════════════════════════════════════════════════════════════════════
 
-            # Validate response is a list
-            if not isinstance(data, list):
-                logger.error(
-                    "Unexpected API response format: expected list, got %s",
-                    type(data).__name__,
-                )
-                return []
+_session = requests.Session()
+_session.headers.update({"User-Agent": "DualMarketBot/3.0"})
 
-            # Validate each item has required fields
-            valid_items = []
-            for item in data:
-                if not isinstance(item, dict):
-                    logger.warning("Skipping non-dict item in API response: %s", item)
-                    continue
-                if "name" not in item:
-                    logger.warning("Skipping item without 'name' field: %s", item)
-                    continue
-                valid_items.append(item)
+# ══════════════════════════════════════════════════════════════════════════════
+# Market definitions
+# ══════════════════════════════════════════════════════════════════════════════
 
-            return valid_items
-
-        except requests.Timeout:
-            logger.error("GSE API request timed out (attempt %d/2)", attempt + 1)
-        except requests.HTTPError as e:
-            # Retry once on server-side problems
-            status = getattr(e.response, "status_code", None)
-            logger.error("GSE API HTTP error (attempt %d/2): %s", attempt + 1, e)
-            if status is not None and status < 500:
-                return []
-        except requests.RequestException as e:
-            logger.error("GSE API request failed (attempt %d/2): %s", attempt + 1, e)
-        except ValueError as e:
-            logger.error("GSE API returned invalid JSON (attempt %d/2): %s", attempt + 1, e)
-            return []
-
-        # Backoff before retrying
-        if attempt == 0:
-            time.sleep(2)
-
-    return []
+@dataclass(frozen=True)
+class ScoringWeights:
+    price_w:    float = 0.6
+    volume_w:   float = 2.0
+    momentum_w: float = 1.0
+    rsi_w:      float = 0.8
+    threshold:  float = 4.0
 
 
-def to_float(value, *, default: float | None = None) -> float | None:
-    """Coerce an API value to float. Returns `default` if parsing fails."""
-    if value is None:
-        return default
-    if isinstance(value, bool):
+@dataclass(frozen=True)
+class MarketConfig:
+    id:           MarketID
+    label:        str
+    flag:         str          # emoji flag
+    currency:     str
+    tz:           ZoneInfo
+    open_h:       int
+    open_m:       int
+    close_h:      int
+    close_m:      int
+    api_url:      str
+    weights:      ScoringWeights
+    min_price:    float = 0.01
+    min_volume:   float = 100.0
+    api_timeout:  int   = 12
+    api_retries:  int   = 3
+    extra_headers: dict[str, str] = field(default_factory=dict)
+
+
+GSE_CONFIG = MarketConfig(
+    id        = MarketID.GSE,
+    label     = "Ghana Stock Exchange",
+    flag      = "🇬🇭",
+    currency  = "GHS",
+    tz        = ZoneInfo("Africa/Accra"),   # UTC+0 year-round
+    open_h    = 9,  open_m  = 30,
+    close_h   = 15, close_m = 0,
+    api_url   = "https://dev.kwayisi.org/apis/gse/live",
+    weights   = ScoringWeights(
+        price_w    = 0.7,
+        volume_w   = 1.5,
+        momentum_w = 0.8,
+        rsi_w      = 0.5,
+        threshold  = 3.5,
+    ),
+    min_price  = 0.01,
+    min_volume = 50.0,
+)
+
+US_CONFIG = MarketConfig(
+    id        = MarketID.US,
+    label     = "US Markets (NYSE / NASDAQ)",
+    flag      = "🇺🇸",
+    currency  = "USD",
+    tz        = ZoneInfo("America/New_York"),
+    open_h    = 9,  open_m  = 30,
+    close_h   = 16, close_m = 0,
+    api_url   = "https://query1.finance.yahoo.com/v8/finance/spark",
+    weights   = ScoringWeights(
+        price_w    = 0.6,
+        volume_w   = 2.0,
+        momentum_w = 1.2,
+        rsi_w      = 1.0,
+        threshold  = 4.5,
+    ),
+    min_price   = 1.00,
+    min_volume  = 10_000.0,
+    api_timeout = 15,
+    api_retries = 4,
+    extra_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+    },
+)
+
+ALL_MARKETS: list[MarketConfig] = [GSE_CONFIG, US_CONFIG]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Utility helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def to_float(value: Any, *, default: float | None = None) -> float | None:
+    """Safely coerce any API value to float."""
+    if value is None or isinstance(value, bool):
         return default
     if isinstance(value, (int, float)):
         return float(value)
     try:
-        s = str(value).strip().replace(",", "")
-        return float(s)
+        return float(str(value).strip().replace(",", ""))
     except (TypeError, ValueError):
         return default
 
 
-def score_stock(current_price: float, current_volume: float, last_price: float, last_volume: float):
+def clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def pct_change(new: float, old: float) -> float:
+    return ((new - old) / old) * 100.0 if old and old > 0 else 0.0
+
+
+def log2_safe(x: float) -> float:
+    """log2(x) floored at 0 — below-average volume is neutral, not negative."""
+    return max(math.log2(x), 0.0) if x > 0 else 0.0
+
+
+def chunks(lst: list, n: int) -> Iterator[list]:
+    for i in range(0, len(lst), n):
+        yield lst[i : i + n]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Scoring engine
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class ScoreResult:
+    score:        float
+    price_change: float
+    volume_ratio: float
+    momentum:     float
+    rsi:          float
+    signal:       SignalType
+    above_thresh: bool
+
+
+def _compute_rsi(prices: list[float], period: int = 14) -> float:
+    """Wilder RSI; returns NaN when fewer than period+1 points available."""
+    if not prices or len(prices) < period + 1:
+        return math.nan
+
+    gains, losses = [], []
+    for i in range(1, len(prices)):
+        d = prices[i] - prices[i - 1]
+        gains.append(max(d, 0.0))
+        losses.append(max(-d, 0.0))
+
+    avg_g = sum(gains[:period]) / period
+    avg_l = sum(losses[:period]) / period
+
+    for i in range(period, len(gains)):
+        avg_g = (avg_g * (period - 1) + gains[i]) / period
+        avg_l = (avg_l * (period - 1) + losses[i]) / period
+
+    if avg_l == 0:
+        return 100.0
+    return 100.0 - (100.0 / (1.0 + avg_g / avg_l))
+
+
+def _classify_signal(
+    price_change: float,
+    volume_ratio: float,
+    momentum:     float,
+    rsi:          float,
+) -> SignalType:
+    r = 50.0 if math.isnan(rsi) else rsi
+
+    if price_change >= 3.0 and volume_ratio >= 2.0:
+        return SignalType.BREAKOUT
+    if price_change >= 1.0 and volume_ratio >= 3.0:
+        return SignalType.ACCUMULATION
+    if price_change >= 2.0 and momentum >= 0.6 and r < 70:
+        return SignalType.MOMENTUM
+    if price_change >= 1.0 and r < 35 and volume_ratio >= 1.5:
+        return SignalType.REVERSAL
+    return SignalType.NONE
+
+
+def score_stock(
+    current_price:  float,
+    current_volume: float,
+    last_price:     float,
+    last_volume:    float,
+    weights:        ScoringWeights,
+    price_history:  list[float] | None = None,
+) -> ScoreResult:
     """
-    Calculate a stock score based on price change and volume ratio.
-
-    Returns:
-        tuple: (score, price_change_pct, volume_ratio)
+    Score formula
+    ─────────────
+      score = max(Δprice%, 0) × price_w
+            + log2(vol_ratio) × volume_w
+            + momentum_norm   × momentum_w
+            + rsi_pts         × rsi_w
     """
-    # Guard against zero division
-    if last_price and last_price > 0:
-        price_change = ((current_price - last_price) / last_price) * 100
-    else:
-        price_change = 0.0
+    price_change = pct_change(current_price, last_price)
+    volume_ratio = (
+        current_volume / last_volume
+        if last_volume and last_volume > 0 else 1.0
+    )
 
-    if last_volume and last_volume > 0:
-        volume_ratio = current_volume / last_volume
-    else:
-        volume_ratio = 1.0  # No previous data, assume baseline
+    # Momentum: rate-of-change over history window, normalised to [0, 1]
+    momentum = 0.0
+    if price_history and len(price_history) >= 2:
+        roc = pct_change(price_history[-1], price_history[0])
+        momentum = clamp(roc / 10.0, 0.0, 1.0)
 
-    # Improved scoring: penalize negative price changes
-    # Weight volume change and absolute price movement
-    score = volume_ratio * 0.5 + price_change * 0.4
+    rsi = _compute_rsi(price_history or [], period=14)
 
-    return score, price_change, volume_ratio
+    # RSI bonus/penalty
+    rsi_pts = 0.0
+    if not math.isnan(rsi):
+        if 40 <= rsi <= 65:
+            rsi_pts = 1.0       # trending sweet-spot
+        elif 30 <= rsi < 40:
+            rsi_pts = 0.5       # potential reversal zone
+        elif rsi > 75:
+            rsi_pts = -0.5      # overbought — discount score
+
+    score = (
+        max(price_change, 0.0) * weights.price_w
+        + log2_safe(volume_ratio)  * weights.volume_w
+        + momentum                 * weights.momentum_w
+        + rsi_pts                  * weights.rsi_w
+    )
+
+    signal = _classify_signal(price_change, volume_ratio, momentum, rsi)
+
+    return ScoreResult(
+        score        = round(score, 4),
+        price_change = price_change,
+        volume_ratio = volume_ratio,
+        momentum     = momentum,
+        rsi          = rsi,
+        signal       = signal,
+        above_thresh = score >= weights.threshold,
+    )
 
 
-def market_open() -> bool:
-    """
-    Check if the Ghana Stock Exchange market is currently open.
-    Trading hours: Mon-Fri, 09:00 to 16:00 (local time).
-    """
-    now = datetime.now()
+# ══════════════════════════════════════════════════════════════════════════════
+# Market-hours helpers
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # Weekday check (0=Monday, 4=Friday)
-    if now.weekday() >= 5:
+def _now(tz: ZoneInfo) -> datetime:
+    return datetime.now(tz=tz)
+
+
+def is_market_open(cfg: MarketConfig) -> bool:
+    """True only during the configured trading session (Mon–Fri)."""
+    if FORCE_SCAN:
+        return True
+    now = _now(cfg.tz)
+    if now.isoweekday() > 5:          # Sat=6, Sun=7
         return False
-
-    start = dtime(9, 0, 0)
-    end = dtime(16, 0, 0)
-    return start <= now.time() <= end
-
-
-def reset_daily_alerts():
-    """Reset alerted stocks at the start of each new day."""
-    global alerted_today
-    if alerted_today:
-        logger.info("Resetting daily alert tracker.")
-        alerted_today.clear()
+    open_t  = now.replace(hour=cfg.open_h,  minute=cfg.open_m,  second=0, microsecond=0)
+    close_t = now.replace(hour=cfg.close_h, minute=cfg.close_m, second=0, microsecond=0)
+    return open_t <= now <= close_t
 
 
-def check_market():
-    """Scan GSE live data and trigger alerts for significant movements."""
-    global first_scan_complete
+# ══════════════════════════════════════════════════════════════════════════════
+# State persistence
+# ══════════════════════════════════════════════════════════════════════════════
 
-    logger.info("Scanning GSE live data...")
-    data = get_live_gse_data()
+def _today_utc() -> str:
+    return datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
 
-    if not data:
-        logger.warning("No valid data received from GSE API.")
-        return
 
-    logger.info("Retrieved %d stocks from GSE API.", len(data))
+def _empty_market_state() -> dict[str, Any]:
+    return {
+        "memory":          {},     # ticker → [price, volume]
+        "history_cache":   {},     # ticker → [float, ...]
+        "baseline_done":   False,
+        "alerted_today":   [],
+        "alert_prices":    {},
+        "eod_sent_today":  False,
+    }
 
-    for item in data:
+
+def _empty_state() -> dict[str, Any]:
+    return {
+        "version": STATE_VERSION,
+        "date":    _today_utc(),
+        "markets": {
+            "GSE": _empty_market_state(),
+            "US":  _empty_market_state(),
+        },
+    }
+
+
+def load_state() -> dict[str, Any]:
+    """
+    Load bot_state.json.
+    Falls back to a clean empty state when:
+      • File missing (first ever run)
+      • File corrupt / wrong version
+      • Saved date ≠ today (automatic daily reset)
+    """
+    if not STATE_FILE.exists():
+        logger.info("No state file — fresh start.")
+        return _empty_state()
+
+    try:
+        raw: dict = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("State file unreadable (%s) — fresh start.", exc)
+        return _empty_state()
+
+    if raw.get("version") != STATE_VERSION:
+        logger.info("State version mismatch — resetting.")
+        return _empty_state()
+
+    today = _today_utc()
+    if raw.get("date") != today:
+        logger.info("New day (%s → %s) — daily reset.", raw.get("date"), today)
+        return _empty_state()
+
+    # Ensure both market sub-dicts exist (safety for partial states)
+    for key in ("GSE", "US"):
+        raw["markets"].setdefault(key, _empty_market_state())
+
+    logger.info(
+        "State loaded — GSE baseline=%s alerted=%d | US baseline=%s alerted=%d",
+        raw["markets"]["GSE"]["baseline_done"],
+        len(raw["markets"]["GSE"]["alerted_today"]),
+        raw["markets"]["US"]["baseline_done"],
+        len(raw["markets"]["US"]["alerted_today"]),
+    )
+    return raw
+
+
+def save_state(state: dict[str, Any]) -> None:
+    """Atomic write: tmp file → rename (avoids corruption on crash)."""
+    state["date"]    = _today_utc()
+    state["version"] = STATE_VERSION
+    tmp = STATE_FILE.with_suffix(".tmp")
+    try:
+        tmp.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(STATE_FILE)
+        logger.info("State saved → %s", STATE_FILE)
+    except OSError as exc:
+        logger.error("Could not save state: %s", exc)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Data fetching
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class StockSnapshot:
+    ticker:        str
+    price:         float
+    volume:        float
+    price_history: list[float]   # newest last; may be empty for GSE
+
+
+def _fetch(
+    url:     str,
+    cfg:     MarketConfig,
+    params:  dict | None = None,
+) -> requests.Response | None:
+    """GET with exponential back-off. Returns Response or None after exhausting retries."""
+    headers = {**_session.headers, **cfg.extra_headers}
+    backoff  = 2.0
+
+    for attempt in range(1, cfg.api_retries + 1):
+        try:
+            r = _session.get(url, params=params, headers=headers, timeout=cfg.api_timeout)
+            r.raise_for_status()
+            return r
+        except requests.Timeout:
+            logger.warning("Timeout %s (attempt %d/%d).", url, attempt, cfg.api_retries)
+        except requests.HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            logger.error("HTTP %s from %s (attempt %d/%d).", status, url, attempt, cfg.api_retries)
+            if status and status < 500:
+                return None
+        except requests.RequestException as exc:
+            logger.error("Request error (attempt %d/%d): %s", attempt, cfg.api_retries, exc)
+
+        if attempt < cfg.api_retries:
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+
+    return None
+
+
+def fetch_gse(cfg: MarketConfig) -> list[StockSnapshot]:
+    r = _fetch(cfg.api_url, cfg)
+    if r is None:
+        return []
+
+    try:
+        raw: list[dict] = r.json()
+    except ValueError:
+        logger.error("GSE API returned non-JSON.")
+        return []
+
+    if not isinstance(raw, list):
+        logger.error("GSE: expected list, got %s.", type(raw).__name__)
+        return []
+
+    out: list[StockSnapshot] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
         ticker = item.get("name")
-        current_price = to_float(item.get("price"), default=None)
-        current_volume = to_float(item.get("volume"), default=None)
+        price  = to_float(item.get("price"))
+        volume = to_float(item.get("volume"), default=0.0)
 
-        if current_price is None or current_volume is None:
-            logger.warning("Skipping %s due to unparseable price/volume.", ticker)
+        if not ticker or price is None:
+            continue
+        if price < cfg.min_price or (volume or 0.0) < cfg.min_volume:
             continue
 
-        last_price, last_volume = market_memory.get(ticker, (0.0, 0.0))
+        out.append(StockSnapshot(ticker=ticker, price=price,
+                                  volume=volume or 0.0, price_history=[]))
 
-        score, price_change, volume_ratio = score_stock(
-            current_price, current_volume, last_price, last_volume
+    logger.info("GSE: %d valid snapshots.", len(out))
+    return out
+
+
+def fetch_us(cfg: MarketConfig, tickers: list[str]) -> list[StockSnapshot]:
+    """
+    Batch-fetch from Yahoo Finance v8 spark endpoint.
+    Splits into chunks of 80 to stay within URL-length limits.
+    """
+    if not tickers:
+        return []
+
+    all_snaps: list[StockSnapshot] = []
+
+    for chunk in chunks(tickers, 80):
+        r = _fetch(
+            cfg.api_url,
+            cfg,
+            params={"symbols": ",".join(chunk), "range": "1mo", "interval": "1d"},
         )
+        if r is None:
+            continue
 
-        # Only alert after we have baseline data (not on first scan)
-        if first_scan_complete and score >= SCORE_THRESHOLD and ticker not in alerted_today:
-            ticker_esc = html_escape(str(ticker))
-            msg = (
-                f"🚨 <b>GSE Signal: {ticker_esc}</b>\n"
-                f"Price: {current_price:.2f}  Change: {price_change:.2f}%\n"
-                f"Volume: {int(current_volume)}  x{volume_ratio:.1f}\n"
-                f"Score: {score:.1f}\n"
-                "Possible breakout/accumulation."
-            )
-            if send_telegram_msg(msg):
-                alerted_today.add(ticker)
-                logger.info("Alert sent for: %s (score=%.1f)", ticker, score)
-            else:
-                logger.warning("Failed to send alert for: %s", ticker)
-
-        market_memory[ticker] = (current_price, current_volume)
-
-    if not first_scan_complete:
-        first_scan_complete = True
-        logger.info(
-            "Baseline scan complete. Loaded %d stocks. Alerts will start on next scan.",
-            len(market_memory),
-        )
-
-
-def telegram_get_me(*, run_id: str = "debug") -> tuple[int | None, dict[str, Any] | None]:
-    """Probe token validity using getMe. Helpful when sendMessage returns 404."""
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
-    try:
-        #region agent log
-        debug_ndjson_log(
-            hypothesis_id="TG_GETME_1",
-            location="gse_trading_bot.py:telegram_get_me:before_request",
-            message="Calling Telegram getMe probe",
-            data={"method": "getMe"},
-            run_id=run_id,
-        )
-        #endregion
-        r = requests.get(url, timeout=10)
-        status = r.status_code
         try:
             body = r.json()
         except ValueError:
-            body = {"raw_prefix": r.text[:200]}
+            logger.error("Yahoo Finance returned non-JSON.")
+            continue
 
-        #region agent log
-        debug_ndjson_log(
-            hypothesis_id="TG_GETME_1",
-            location="gse_trading_bot.py:telegram_get_me:after_response",
-            message="Telegram getMe probe finished",
-            data={"status_code": status, "body_prefix": json.dumps(body)[:200]},
-            run_id=run_id,
+        # Yahoo v8 spark returns {"spark": {"result": {ticker: {...}, ...}}}
+        # but occasionally wraps result in a list — handle both shapes
+        raw_result = (body.get("spark") or {}).get("result") or {}
+
+        if isinstance(raw_result, list):
+            spark: dict[str, Any] = {
+                item["symbol"]: item
+                for item in raw_result
+                if isinstance(item, dict) and "symbol" in item
+            }
+        else:
+            spark = raw_result
+
+        for ticker in chunk:
+            entry = spark.get(ticker)
+            if not entry:
+                logger.debug("No Yahoo data for %s.", ticker)
+                continue
+
+            try:
+                resp_list = entry.get("response") or []
+                if not resp_list:
+                    continue
+                resp    = resp_list[0]
+                meta    = resp.get("meta") or {}
+                quote_0 = (resp.get("indicators") or {}).get("quote") or [{}]
+                closes  = [c for c in (quote_0[0].get("close")  or []) if c is not None]
+                volumes = [v for v in (quote_0[0].get("volume") or []) if v is not None]
+            except (IndexError, AttributeError, TypeError) as exc:
+                logger.debug("Malformed Yahoo entry for %s: %s", ticker, exc)
+                continue
+
+            if not closes:
+                continue
+
+            price  = to_float(meta.get("regularMarketPrice")) or closes[-1]
+            volume = to_float(meta.get("regularMarketVolume")) or (volumes[-1] if volumes else 0.0)
+
+            if price is None or float(price) < cfg.min_price:
+                continue
+            if (volume or 0.0) < cfg.min_volume:
+                continue
+
+            all_snaps.append(StockSnapshot(
+                ticker        = ticker,
+                price         = float(price),
+                volume        = float(volume or 0.0),
+                price_history = [float(c) for c in closes],
+            ))
+
+    logger.info("US: %d valid snapshots.", len(all_snaps))
+    return all_snaps
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Telegram
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TelegramClient:
+
+    def __init__(self, token: str, chat_id: str) -> None:
+        self.token   = token
+        self.chat_id = chat_id
+        self._ready  = False
+
+    def validate(self) -> bool:
+        """Confirm the token is live and CHAT_ID is not the bot's own ID."""
+        if not self._token_ok():
+            logger.error("BOT_TOKEN malformed (expected <digits>:<secret>).")
+            return False
+
+        url = f"https://api.telegram.org/bot{self.token}/getMe"
+        try:
+            r    = _session.get(url, timeout=10)
+            body = r.json() if "application/json" in r.headers.get("content-type", "") else {}
+        except requests.RequestException as exc:
+            logger.error("getMe failed: %s", exc)
+            return False
+
+        if r.status_code != 200 or not body.get("ok"):
+            logger.error("getMe returned HTTP %d — check BOT_TOKEN.", r.status_code)
+            return False
+
+        bot_id = str((body.get("result") or {}).get("id", ""))
+        if bot_id and bot_id == self.chat_id.strip():
+            logger.error(
+                "CHAT_ID (%s) is the bot's own ID. "
+                "Send /start to @userinfobot to get your personal ID.",
+                bot_id,
+            )
+            return False
+
+        logger.info("Telegram OK (bot id=%s).", bot_id)
+        self._ready = True
+        return True
+
+    def send(self, text: str) -> bool:
+        """Send HTML-formatted message. json= ensures correct Content-Type."""
+        if not self._ready:
+            logger.info("[TG suppressed] %s", text[:120])
+            return False
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        try:
+            r = _session.post(
+                url,
+                json={"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                return True
+            logger.error("sendMessage HTTP %d: %s", r.status_code, r.text[:300])
+            return False
+        except requests.RequestException as exc:
+            logger.error("sendMessage exception: %s", exc)
+            return False
+
+    def _token_ok(self) -> bool:
+        parts = (self.token or "").split(":", 1)
+        return len(parts) == 2 and parts[0].isdigit() and len(parts[1]) >= 25
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Alert message builders
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SIGNAL_EMOJI = {
+    SignalType.BREAKOUT:     "🚀",
+    SignalType.ACCUMULATION: "🏦",
+    SignalType.MOMENTUM:     "⚡",
+    SignalType.REVERSAL:     "🔄",
+    SignalType.NONE:         "📊",
+}
+
+
+def _alert_msg(
+    cfg:    MarketConfig,
+    ticker: str,
+    result: ScoreResult,
+    price:  float,
+    volume: float,
+) -> str:
+    emoji  = _SIGNAL_EMOJI.get(result.signal, "📊")
+    dir_e  = "📈" if result.price_change >= 0 else "📉"
+    rsi_s  = f"{result.rsi:.1f}" if not math.isnan(result.rsi) else "N/A"
+    mom_s  = f"{result.momentum * 100:.1f}%"
+
+    return (
+        f"{emoji} <b>{cfg.flag} {cfg.label} Signal</b>\n"
+        f"<b>Ticker:</b> {ticker}\n"
+        f"<b>Signal:</b> {result.signal.value}\n"
+        "\n"
+        f"<b>Price:</b> {cfg.currency} {price:.4f}  {dir_e} {result.price_change:+.2f}%\n"
+        f"<b>Volume:</b> {int(volume):,}  ×{result.volume_ratio:.2f} avg\n"
+        f"<b>Momentum:</b> {mom_s}   <b>RSI(14):</b> {rsi_s}\n"
+        f"<b>Score:</b> {result.score:.2f}  (threshold {cfg.weights.threshold})\n"
+        "\n"
+        "⚡ Apply your own analysis before acting."
+    )
+
+
+def _eod_msg(cfg: MarketConfig, changes: dict[str, float]) -> str:
+    flag = cfg.flag
+    lines = [f"📋 <b>{flag} {cfg.label} — Daily Summary</b>\n"]
+    if not changes:
+        lines.append("No alerts were sent today.")
+    else:
+        for ticker, chg in sorted(changes.items(), key=lambda x: -x[1]):
+            arrow = "📈" if chg >= 0 else "📉"
+            lines.append(f"  {arrow} <b>{ticker}</b>: {chg:+.2f}% since alert")
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Core scan logic
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _get_snapshots(cfg: MarketConfig) -> list[StockSnapshot]:
+    if cfg.id == MarketID.GSE:
+        return fetch_gse(cfg)
+    if cfg.id == MarketID.US:
+        return fetch_us(cfg, US_WATCHLIST)
+    return []
+
+
+def run_scan(
+    cfg:     MarketConfig,
+    saved:   dict[str, Any],
+    tg:      TelegramClient,
+) -> None:
+    """
+    One complete scan cycle for a single market.
+    Mutates `saved["markets"][key]` in-place so the caller can persist it.
+    """
+    key   = cfg.id.name           # "GSE" or "US"
+    mdata = saved["markets"][key]
+
+    snaps = _get_snapshots(cfg)
+    if not snaps:
+        logger.warning("[%s] No data returned — skipping scan.", key)
+        return
+
+    logger.info("[%s] Processing %d tickers.", key, len(snaps))
+
+    memory:        dict[str, tuple[float, float]] = {
+        k: (float(v[0]), float(v[1])) for k, v in mdata["memory"].items()
+    }
+    history_cache: dict[str, list[float]] = {
+        k: [float(p) for p in v] for k, v in mdata["history_cache"].items()
+    }
+    alerted_today: set[str]  = set(mdata["alerted_today"])
+    alert_prices:  dict[str, float] = dict(mdata["alert_prices"])
+    baseline_done: bool       = mdata["baseline_done"]
+
+    alerts_sent = 0
+
+    for snap in snaps:
+        last_price, last_vol = memory.get(snap.ticker, (0.0, 0.0))
+
+        # Merge incoming history with cached history (keep latest 60 bars)
+        if snap.price_history:
+            merged = history_cache.get(snap.ticker, []) + snap.price_history
+            history_cache[snap.ticker] = merged[-60:]
+        combined = history_cache.get(snap.ticker)
+
+        result = score_stock(
+            current_price  = snap.price,
+            current_volume = snap.volume,
+            last_price     = last_price,
+            last_volume    = last_vol,
+            weights        = cfg.weights,
+            price_history  = combined or None,
         )
-        #endregion
-        return status, body if isinstance(body, dict) else None
-    except requests.RequestException as e:
-        #region agent log
-        debug_ndjson_log(
-            hypothesis_id="TG_GETME_2",
-            location="gse_trading_bot.py:telegram_get_me:exception",
-            message="Telegram getMe probe exception",
-            data={"error": str(e)[:200]},
-            run_id=run_id,
+
+        # Always update memory regardless of alert
+        memory[snap.ticker] = (snap.price, snap.volume)
+
+        should_alert = (
+            baseline_done
+            and result.above_thresh
+            and result.signal != SignalType.NONE
+            and snap.ticker not in alerted_today
         )
-        #endregion
-        return None, None
+
+        if should_alert:
+            msg  = _alert_msg(cfg, snap.ticker, result, snap.price, snap.volume)
+            sent = tg.send(msg)
+            if sent:
+                alerted_today.add(snap.ticker)
+                alert_prices[snap.ticker] = snap.price
+                alerts_sent += 1
+                logger.info(
+                    "[%s] ✓ %s | %s | score=%.2f Δ%+.2f%% vol×%.1f RSI=%s",
+                    key, snap.ticker, result.signal.value, result.score,
+                    result.price_change, result.volume_ratio,
+                    f"{result.rsi:.0f}" if not math.isnan(result.rsi) else "N/A",
+                )
+
+    if not baseline_done:
+        logger.info("[%s] Baseline set (%d tickers). Alerts start next scan.", key, len(memory))
+
+    elif alerts_sent == 0:
+        logger.info("[%s] Scan complete — no signals above %.1f.", key, cfg.weights.threshold)
+
+    # Write back into saved dict
+    mdata["memory"]        = {k: list(v) for k, v in memory.items()}
+    mdata["history_cache"] = dict(history_cache)
+    mdata["baseline_done"] = True
+    mdata["alerted_today"] = list(alerted_today)
+    mdata["alert_prices"]  = dict(alert_prices)
+
+
+def run_eod(
+    cfg:   MarketConfig,
+    saved: dict[str, Any],
+    tg:    TelegramClient,
+) -> None:
+    """Send end-of-day P&L summary for alerted tickers (fires once per day)."""
+    key   = cfg.id.name
+    mdata = saved["markets"][key]
+
+    if not mdata["baseline_done"] or mdata["eod_sent_today"]:
+        return
+
+    alerted_today = set(mdata["alerted_today"])
+    if not alerted_today:
+        mdata["eod_sent_today"] = True
+        return
+
+    # Fetch current prices for P&L calc
+    snaps     = _get_snapshots(cfg)
+    price_map = {s.ticker: s.price for s in snaps}
+    changes: dict[str, float] = {}
+
+    for ticker in alerted_today:
+        alert_px   = mdata["alert_prices"].get(ticker)
+        current_px = price_map.get(ticker)
+        if alert_px and current_px and float(alert_px) > 0:
+            changes[ticker] = pct_change(float(current_px), float(alert_px))
+
+    tg.send(_eod_msg(cfg, changes))
+    mdata["eod_sent_today"] = True
+    logger.info("[%s] EOD summary sent (%d tickers).", key, len(changes))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Entry point
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main() -> int:
+    logger.info(
+        "=== Dual-Market Bot run start | UTC %s | FORCE_SCAN=%s ===",
+        datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        FORCE_SCAN,
+    )
+
+    # ── Telegram ──────────────────────────────────────────────────────────
+    tg = TelegramClient(token=BOT_TOKEN, chat_id=CHAT_ID)
+    tg.validate()
+
+    # ── State ─────────────────────────────────────────────────────────────
+    saved = load_state()
+
+    # ── Determine open / closed markets ───────────────────────────────────
+    open_markets   = [cfg for cfg in ALL_MARKETS if     is_market_open(cfg)]
+    closed_markets = [cfg for cfg in ALL_MARKETS if not is_market_open(cfg)]
+
+    logger.info(
+        "Open: %s | Closed: %s",
+        [c.id.name for c in open_markets]  or "none",
+        [c.id.name for c in closed_markets] or "none",
+    )
+
+    if not open_markets:
+        logger.info("Both markets closed — checking EOD summaries then exiting.")
+
+    # ── Scan open markets ─────────────────────────────────────────────────
+    for cfg in open_markets:
+        run_scan(cfg, saved, tg)
+
+    # ── EOD summary for closed markets that were active today ─────────────
+    for cfg in closed_markets:
+        run_eod(cfg, saved, tg)
+
+    # ── Persist state ─────────────────────────────────────────────────────
+    save_state(saved)
+
+    logger.info("=== Run complete ===")
+    return 0
 
 
 if __name__ == "__main__":
-    logger.info("GSE Trading Bot started. Polling every %d seconds.", POLL_INTERVAL_SECONDS)
-    try:
-        if not bot_token_looks_valid(BOT_TOKEN):
-            logger.error(
-                "BOT_TOKEN must be the full string from @BotFather: <digits>:<secret> "
-                "(for example 123456789:AAH...). If yours has no ':', you copied only part of the token."
-            )
-            #region agent log
-            debug_ndjson_log(
-                hypothesis_id="TG_TOKEN_FORMAT",
-                location="gse_trading_bot.py:__main__:token_format",
-                message="BOT_TOKEN format invalid (missing id:secret shape)",
-                data={"has_colon": ":" in str(BOT_TOKEN)},
-            )
-            #endregion
-            TELEGRAM_ENABLED = False
-        else:
-            #region agent log
-            debug_ndjson_log(
-                hypothesis_id="TG_TOKEN_FORMAT",
-                location="gse_trading_bot.py:__main__:token_format",
-                message="BOT_TOKEN format looks valid; probing getMe",
-                data={"looks_valid": True},
-            )
-            #endregion
-            # Runtime evidence: getMe 404 means Telegram rejects the token (not chat_id / parse_mode).
-            status, body = telegram_get_me(run_id="debug_startup")
-            TELEGRAM_ENABLED = (
-                status == 200
-                and isinstance(body, dict)
-                and body.get("ok") is True
-            )
-            if not TELEGRAM_ENABLED:
-                logger.error(
-                    "Telegram rejected BOT_TOKEN (getMe HTTP %s). "
-                    "Open @BotFather, create a bot or copy the token again, then update BOT_TOKEN.",
-                    status if status is not None else "error",
-                )
-            else:
-                logger.info("Telegram BOT_TOKEN validated (getMe ok).")
-                bot_user_id = None
-                if isinstance(body, dict) and isinstance(body.get("result"), dict):
-                    bot_user_id = body["result"].get("id")
-                if bot_user_id is not None and str(CHAT_ID).strip() == str(bot_user_id):
-                    TELEGRAM_SEND_OK = False
-                    logger.error(
-                        "CHAT_ID (%s) is the bot's own Telegram user id. You cannot message a bot from a bot. "
-                        "Set CHAT_ID to YOUR personal user id (message @userinfobot and use the number it shows), "
-                        "or a group/channel id where the bot is allowed to post.",
-                        bot_user_id,
-                    )
-                    #region agent log
-                    debug_ndjson_log(
-                        hypothesis_id="TG_CHAT_BOT_SELF",
-                        location="gse_trading_bot.py:__main__:chat_vs_bot",
-                        message="CHAT_ID equals bot id; sendMessage would return 403",
-                        data={"bot_user_id": bot_user_id},
-                    )
-                    #endregion
-                else:
-                    TELEGRAM_SEND_OK = True
-                    send_telegram_msg("🤖 GSE Trading Bot started and monitoring markets.")
-    except Exception:
-        logger.warning("Could not send startup notification to Telegram.")
-
-    last_reset_day = datetime.now().day
-
-    while True:
-        try:
-            now = datetime.now()
-
-            # Reset alerts at the start of each new day
-            if now.day != last_reset_day:
-                reset_daily_alerts()
-                last_reset_day = now.day
-
-            if market_open():
-                check_market()
-            else:
-                logger.info("Market closed. Waiting for next poll.")
-
-            time.sleep(POLL_INTERVAL_SECONDS)
-
-        except KeyboardInterrupt:
-            logger.info("Bot stopped by user.")
-            send_telegram_msg("🤖 GSE Trading Bot stopped.")
-            sys.exit(0)
-        except Exception as e:
-            logger.exception("Unexpected error in main loop: %s", e)
-            time.sleep(POLL_INTERVAL_SECONDS)
-
+    sys.exit(main())
