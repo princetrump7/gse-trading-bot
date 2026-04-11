@@ -87,13 +87,13 @@ jobs:
             gse-state-${{ runner.os }}-
 
       # ── 5. Run scan ──────────────────────────────────────────────────────────
-      - name: Run GSE scan (--once mode)
-        run: python gse_trading_bot.py --once
+      - name: Run GSE scan
+        run: python gse_trading_bot.py
         env:
-          BOT_TOKEN:      ${{ secrets.BOT_TOKEN }}
-          CHAT_ID:        ${{ secrets.CHAT_ID }}
-          GSE_STATE_FILE: bot_state.json
-          GSE_BOT_DEBUG:  ${{ inputs.debug == 'true' && '1' || '0' }}
+          TG_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TG_CHAT_ID:   ${{ secrets.CHAT_ID }}
+          STATE_FILE:   bot_state.json
+          BOT_DEBUG:    ${{ inputs.debug == 'true' && '1' || '0' }}
 
       # ── 6. Upload debug log (only on manual debug runs) ──────────────────────
       - name: Upload debug log
