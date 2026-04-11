@@ -60,25 +60,11 @@ jobs:
       # any extra logic in the workflow.
       # 'restore-keys' falls back to yesterday's cache if today's doesn't exist
       # yet (e.g. first run of the day) so market_memory is still warm.
-      - name: Restore bot state
-        uses: actions/cache@v4
-        with:
-          path: bot_state.json
-          key: gse-state-${{ runner.os }}-${{ env.TODAY }}
-          restore-keys: |
-            gse-state-${{ runner.os }}-
-        env:
-          TODAY: ${{ fromJSON('{}') }}   # placeholder — real value set below
-
-      # TODAY must be evaluated at run time, not in the key template above.
-      # We write it to GITHUB_ENV so subsequent steps (and the cache key) can use it.
       - name: Set TODAY env var (WAT = UTC+0)
+        id: today
         run: echo "TODAY=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
 
-      # Re-declare the cache with the resolved TODAY so the save step uses the
-      # correct date-scoped key. (actions/cache saves with the key from its step.)
-      - name: Restore bot state (date-keyed)
-        id: bot-state-cache
+      - name: Restore bot state
         uses: actions/cache@v4
         with:
           path: bot_state.json
@@ -100,7 +86,7 @@ jobs:
         if: ${{ inputs.debug }}
         uses: actions/upload-artifact@v4
         with:
-          name: debug-log-${{ env.TODAY }}
+          name: debug-log
           path: debug-5ad608.log
           if-no-files-found: ignore
           retention-days: 3
