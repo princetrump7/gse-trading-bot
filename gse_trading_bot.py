@@ -382,6 +382,7 @@ def _empty_state() -> dict[str, Any]:
             "GSE": _empty_market_state(),
             "US":  _empty_market_state(),
         },
+        "custom_watchlist": [],
     }
 
 
@@ -661,6 +662,67 @@ class TelegramClient:
             logger.error("sendMessage exception: %s", exc)
             return False
 
+    def handle_command(self, text: str, watchlist: list[str]) -> str | None:
+        """Process /add, /remove, /list commands. Returns response message."""
+        parts = text.strip().split()
+        if not parts:
+            return None
+
+        cmd = parts[0].lower()
+        args = parts[1:] if len(parts) > 1 else []
+
+        if cmd == "/list":
+            if not watchlist:
+                return "📋 <b>Watchlist</b> is empty. Default US watchlist in use."
+            return "📋 <b>Custom Watchlist</b>\n" + ", ".join(watchlist)
+
+        if cmd == "/add":
+            if not args:
+                return "Usage: /add AAPL MSFT GOOGL"
+            added = [t.upper() for t in args if t.isalpha()]
+            for t in added:
+                if t not in watchlist:
+                    watchlist.append(t)
+            return f"✅ Added: {', '.join(added)}"
+
+        if cmd == "/remove":
+            if not args:
+                return "Usage: /remove AAPL"
+            removed = []
+            for t in args:
+                t = t.upper()
+                if t in watchlist:
+                    watchlist.remove(t)
+                    removed.append(t)
+            if removed:
+                return f"🗑️ Removed: {', '.join(removed)}"
+            return "⚠️ Tickers not found in custom watchlist."
+
+        if cmd == "/help":
+            return (
+                "📖 <b>Commands</b>\n"
+                "/add TICKER... — Add stocks\n"
+                "/remove TICKER... — Remove stocks\n"
+                "/list — Show watchlist\n"
+                "/help — Show this help"
+            )
+
+        return None
+
+    def get_updates(self, offset: int = 0) -> list[dict]:
+        """Poll for new command messages."""
+        if not self._ready:
+            return []
+        url = f"https://api.telegram.org/bot{self.token}/getUpdates"
+        try:
+            r = _session.get(url, params={"timeout": 1, "offset": offset}, timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                return data.get("result", [])
+        except requests.RequestException:
+            pass
+        return []
+
     def _token_ok(self) -> bool:
         """Telegram bot tokens are always '<numeric_bot_id>:<secret>' from @BotFather."""
         parts = (self.token or "").split(":", 1)
@@ -868,11 +930,29 @@ def main() -> int:
             "🤖 <b>Dual-Market Bot Started</b>\n"
             f"Monitoring: 🇬🇭 GSE + 🇺🇸 US\n"
             f"Watchlist: {len(US_WATCHLIST)} US stocks\n"
-            "Scanning markets..."
+            "Scanning markets...\n"
+            "Send /help for commands."
         )
 
     # ── State ─────────────────────────────────────────────────────────────
     saved = load_state()
+
+    # ── Process Telegram commands ───────────────────────────────────────
+    custom_watchlist: list[str] = saved.get("custom_watchlist", [])
+    if tg._ready and custom_watchlist:
+        updates = tg.get_updates()
+        last_update_id = 0
+        for update in updates:
+            last_update_id = update.get("update_id", 0) + 1
+            msg = (update.get("message") or {}).get("text", "")
+            chat = str((update.get("message") or {}).get("chat", {}).get("id", ""))
+            if msg and chat == tg.chat_id:
+                resp = tg.handle_command(msg, custom_watchlist)
+                if resp:
+                    tg.send(resp)
+        if last_update_id:
+            tg.get_updates(offset=last_update_id)
+        saved["custom_watchlist"] = custom_watchlist
 
     # ── Determine open / closed markets ───────────────────────────────────
     open_markets   = [cfg for cfg in ALL_MARKETS if     is_market_open(cfg)]
