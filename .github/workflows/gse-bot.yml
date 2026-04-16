@@ -6,6 +6,14 @@ name: GSE Trading Bot
 # the market is closed, so a slightly-wide cron window is safe and cheap.
 # Manual trigger lets you run a scan or force-restart at any time.
 on:
+  push:
+    branches:
+      - master
+    paths:
+      - '.github/workflows/gse-bot.yml'
+      - 'bot.py'
+      - 'requirements.txt'
+      - 'README.md'
   workflow_dispatch:
     inputs:
       debug:
