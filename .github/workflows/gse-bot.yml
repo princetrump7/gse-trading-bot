@@ -1,0 +1,92 @@
+name: GSE Trading Bot
+
+# ─── Triggers ────────────────────────────────────────────────────────────────
+# Cron fires every 10 min during GSE market hours (09:30–15:00 UTC/WAT Mon-Fri).
+# The Python script itself double-checks market_open() and exits immediately if
+# the market is closed, so a slightly-wide cron window is safe and cheap.
+# Manual trigger lets you run a scan or force-restart at any time.
+on:
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: 'Enable debug logging (GSE_BOT_DEBUG=1)'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: '*/10 9-15 * * 1-5'   # Mon–Fri, 09:xx–15:xx UTC
+
+# ─── Concurrency ─────────────────────────────────────────────────────────────
+# Prevents two simultaneous scans if a run takes longer than 10 min.
+# 'cancel-in-progress: false' queues the new run rather than discarding it,
+# so no scan is ever silently skipped.
+concurrency:
+  group: gse-bot-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    name: GSE Market Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5        # Each scan should finish in < 30s; 5 min is generous.
+
+    steps:
+      # ── 1. Checkout ─────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python setup ─────────────────────────────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # ── 3. Pip cache ─────────────────────────────────────────────────────────
+      # Caches the pip download cache so 'pip install requests' is instant on
+      # repeated runs (no network hit after the first run of the day).
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-requests
+          restore-keys: pip-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: pip install --quiet requests
+
+      # ── 4. Bot state cache ───────────────────────────────────────────────────
+      # market_memory and alerted_today live in bot_state.json between runs.
+      # Key is date-scoped: alerted_today auto-resets at midnight WAT without
+      # any extra logic in the workflow.
+      # 'restore-keys' falls back to yesterday's cache if today's doesn't exist
+      # yet (e.g. first run of the day) so market_memory is still warm.
+      - name: Set TODAY env var (WAT = UTC+0)
+        id: today
+        run: echo "TODAY=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Restore bot state
+        uses: actions/cache@v4
+        with:
+          path: bot_state.json
+          key: gse-state-${{ runner.os }}-$(date -u +%Y-%m-%d)
+          restore-keys: |
+            gse-state-${{ runner.os }}-
+
+      # ── 5. Run scan ──────────────────────────────────────────────────────────
+      - name: Run GSE scan
+        run: python gse_trading_bot.py
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
+          STATE_FILE:   bot_state.json
+          BOT_DEBUG:    ${{ inputs.debug && 1 || 0 }}
+
+      # ── 6. Upload debug log (only on manual debug runs) ──────────────────────
+      - name: Upload debug log
+        if: ${{ inputs.debug }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-log
+          path: debug-5ad608.log
+          if-no-files-found: ignore
+          retention-days: 3

@@ -1,4 +1,3 @@
-requests
-python-telegram-bot
+requests>=2.31.0
 pandas
 numpy

@@ -32,11 +32,14 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.cursor/
 
 # Log files
 *.log
+debug-*.log
 history.json
 volume.json
+alert_state.json
 
 # IDE / editor specific
 .vscode/
@@ -46,3 +49,4 @@ volume.json
 *.njsproj
 *.sln
 *.sw?
+learn/
