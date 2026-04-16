@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       debug:
-        description: 'Enable debug logging (GSE_BOT_DEBUG=1)'
+        description: 'Enable debug logging'
         required: false
         default: false
         type: boolean
@@ -40,53 +40,43 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      # ── 3. Pip cache ─────────────────────────────────────────────────────────
-      # Caches the pip download cache so 'pip install requests' is instant on
-      # repeated runs (no network hit after the first run of the day).
-      - name: Cache pip dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ runner.os }}-requests
-          restore-keys: pip-${{ runner.os }}-
+          cache: 'pip'
 
       - name: Install dependencies
-        run: pip install --quiet requests
+        run: pip install --quiet -r requirements.txt
 
       # ── 4. Bot state cache ───────────────────────────────────────────────────
-      # market_memory and alerted_today live in bot_state.json between runs.
-      # Key is date-scoped: alerted_today auto-resets at midnight WAT without
-      # any extra logic in the workflow.
-      # 'restore-keys' falls back to yesterday's cache if today's doesn't exist
-      # yet (e.g. first run of the day) so market_memory is still warm.
-      - name: Set TODAY env var (WAT = UTC+0)
-        id: today
+      - name: Set TODAY env var
         run: echo "TODAY=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
 
-      - name: Restore bot state
+      - name: Restore bot state cache
         uses: actions/cache@v4
         with:
-          path: bot_state.json
-          key: gse-state-${{ runner.os }}-$(date -u +%Y-%m-%d)
+          path: |
+            history.json
+            volume.json
+            alert_state.json
+          key: gse-state-${{ runner.os }}-${{ env.TODAY }}
           restore-keys: |
             gse-state-${{ runner.os }}-
 
       # ── 5. Run scan ──────────────────────────────────────────────────────────
       - name: Run GSE scan
-        run: python gse_trading_bot.py
+        run: python bot.py
         env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
-          STATE_FILE:   bot_state.json
-          BOT_DEBUG:    ${{ inputs.debug && 1 || 0 }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          PYTHONUNBUFFERED: '1'
+          BOT_DEBUG: ${{ inputs.debug && '1' || '0' }}
 
-      # ── 6. Upload debug log (only on manual debug runs) ──────────────────────
-      - name: Upload debug log
-        if: ${{ inputs.debug }}
+      - name: Upload bot state artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-log
-          path: debug-5ad608.log
+          name: gse-bot-state
+          path: |
+            history.json
+            volume.json
+            alert_state.json
           if-no-files-found: ignore
-          retention-days: 3
+          retention-days: 7

@@ -33,6 +33,9 @@ EMA_FAST = 9
 EMA_SLOW = 21
 VOLATILITY_PERIOD = 14
 MIN_HISTORY = 25
+HMM_MIN_HISTORY = int(os.environ.get("HMM_MIN_HISTORY", "30"))
+HMM_CONFIDENCE_THRESHOLD = float(os.environ.get("HMM_CONFIDENCE_THRESHOLD", "0.60"))
+HMM_FIT_ITERATIONS = int(os.environ.get("HMM_FIT_ITERATIONS", "6"))
 
 # Risk/Reward
 RR_RATIO = 2.0
@@ -163,6 +166,122 @@ def calc_volatility(prices: list, period: int = VOLATILITY_PERIOD) -> float:
         return returns.mean() if not returns.empty else 0.0
     return returns.tail(period).mean()
 
+def calc_returns(prices: list[float]) -> np.ndarray:
+    if len(prices) < 2:
+        return np.array([], dtype=float)
+    series = pd.Series(prices, dtype=float)
+    returns = series.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    return returns.to_numpy(dtype=float)
+
+def gaussian_log_pdf(x: float, mean: float, std: float) -> float:
+    variance = max(std ** 2, 1e-8)
+    return -0.5 * np.log(2 * np.pi * variance) - ((x - mean) ** 2) / (2 * variance)
+
+def viterbi_path(
+    obs: np.ndarray,
+    init_probs: np.ndarray,
+    trans: np.ndarray,
+    means: np.ndarray,
+    stds: np.ndarray,
+) -> np.ndarray:
+    n_obs = len(obs)
+    n_states = len(init_probs)
+    log_init = np.log(np.clip(init_probs, 1e-8, 1.0))
+    log_trans = np.log(np.clip(trans, 1e-8, 1.0))
+    dp = np.full((n_obs, n_states), -np.inf, dtype=float)
+    back = np.zeros((n_obs, n_states), dtype=int)
+
+    for state in range(n_states):
+        dp[0, state] = log_init[state] + gaussian_log_pdf(obs[0], means[state], stds[state])
+
+    for idx in range(1, n_obs):
+        for state in range(n_states):
+            candidates = dp[idx - 1] + log_trans[:, state]
+            best_prev = int(np.argmax(candidates))
+            dp[idx, state] = candidates[best_prev] + gaussian_log_pdf(obs[idx], means[state], stds[state])
+            back[idx, state] = best_prev
+
+    path = np.zeros(n_obs, dtype=int)
+    path[-1] = int(np.argmax(dp[-1]))
+    for idx in range(n_obs - 2, -1, -1):
+        path[idx] = back[idx + 1, path[idx + 1]]
+    return path
+
+def forward_state_probs(
+    obs: np.ndarray,
+    init_probs: np.ndarray,
+    trans: np.ndarray,
+    means: np.ndarray,
+    stds: np.ndarray,
+) -> np.ndarray:
+    alpha = np.clip(init_probs, 1e-8, 1.0).astype(float)
+    alpha = alpha / alpha.sum()
+
+    for idx, value in enumerate(obs):
+        emission = np.array(
+            [np.exp(gaussian_log_pdf(value, means[state], stds[state])) for state in range(len(alpha))],
+            dtype=float,
+        )
+        if idx == 0:
+            alpha = alpha * emission
+        else:
+            alpha = (alpha @ trans) * emission
+        alpha = alpha / max(alpha.sum(), 1e-8)
+    return alpha
+
+def infer_hmm_regime(prices: list[float]) -> dict | None:
+    returns = calc_returns(prices)
+    if len(returns) < HMM_MIN_HISTORY:
+        return None
+
+    median = float(np.median(returns))
+    states = np.where(returns >= median, 1, 0)
+    if np.all(states == states[0]):
+        states[-1] = 1 - states[-1]
+
+    overall_std = max(float(np.std(returns)), 1e-4)
+    init_probs = np.array([0.5, 0.5], dtype=float)
+    trans = np.array([[0.5, 0.5], [0.5, 0.5]], dtype=float)
+    means = np.array([float(np.mean(returns)), float(np.mean(returns))], dtype=float)
+    stds = np.array([overall_std, overall_std], dtype=float)
+
+    for _ in range(HMM_FIT_ITERATIONS):
+        for state in range(2):
+            state_obs = returns[states == state]
+            if len(state_obs) == 0:
+                means[state] = float(np.mean(returns))
+                stds[state] = overall_std
+            else:
+                means[state] = float(np.mean(state_obs))
+                stds[state] = max(float(np.std(state_obs)), overall_std * 0.5, 1e-4)
+
+        init_counts = np.ones(2, dtype=float)
+        init_counts[states[0]] += 1.0
+        init_probs = init_counts / init_counts.sum()
+
+        trans_counts = np.ones((2, 2), dtype=float)
+        for prev_state, next_state in zip(states[:-1], states[1:]):
+            trans_counts[prev_state, next_state] += 1.0
+        trans = trans_counts / trans_counts.sum(axis=1, keepdims=True)
+
+        new_states = viterbi_path(returns, init_probs, trans, means, stds)
+        if np.array_equal(new_states, states):
+            states = new_states
+            break
+        states = new_states
+
+    bullish_state = int(np.argmax(means))
+    bearish_state = int(np.argmin(means))
+    posterior = forward_state_probs(returns, init_probs, trans, means, stds)
+    current_state = int(np.argmax(posterior))
+
+    return {
+        "state": "BULL" if current_state == bullish_state else "BEAR",
+        "confidence": float(posterior[current_state]),
+        "bull_prob": float(posterior[bullish_state]),
+        "bear_prob": float(posterior[bearish_state]),
+    }
+
 def has_fresh_tick(ticker: str, price: float, volume: int) -> bool:
     ph = price_history[ticker]
     vh = volume_history[ticker]
@@ -213,6 +332,7 @@ def generate_signal(ticker: str, price: float, volume: int) -> dict | None:
 
     rsi = calc_rsi(ph)
     volatility = calc_volatility(ph)
+    hmm_regime = infer_hmm_regime(ph)
     if not vh:
         avg_vol = volume
     else:
@@ -237,13 +357,16 @@ def generate_signal(ticker: str, price: float, volume: int) -> dict | None:
         or pd.isna(volatility)
         or volatility <= 0
         or volume < MIN_VOLUME
+        or hmm_regime is None
     ):
         return None
 
     bullish_cross = prev_ema9 <= prev_ema21 and ema9 > ema21
     bearish_cross = prev_ema9 >= prev_ema21 and ema9 < ema21
+    hmm_bull_ok = hmm_regime["state"] == "BULL" and hmm_regime["bull_prob"] >= HMM_CONFIDENCE_THRESHOLD
+    hmm_bear_ok = hmm_regime["state"] == "BEAR" and hmm_regime["bear_prob"] >= HMM_CONFIDENCE_THRESHOLD
 
-    if rsi < RSI_OVERSOLD and bullish_cross and vol_ok:
+    if rsi < RSI_OVERSOLD and bullish_cross and vol_ok and hmm_bull_ok:
         sl = round(max(price - ATR_SL_MULT * volatility, 0.0001), 4)
         tp = round(price + ATR_SL_MULT * volatility * RR_RATIO, 4)
         return {
@@ -256,9 +379,13 @@ def generate_signal(ticker: str, price: float, volume: int) -> dict | None:
             "ema21": ema21,
             "volatility": volatility,
             "vol_ratio": (volume / avg_vol if avg_vol > 0 else 1),
+            "hmm_state": hmm_regime["state"],
+            "hmm_confidence": hmm_regime["confidence"],
+            "hmm_bull_prob": hmm_regime["bull_prob"],
+            "hmm_bear_prob": hmm_regime["bear_prob"],
         }
 
-    if rsi > RSI_OVERBOUGHT and bearish_cross and vol_ok:
+    if rsi > RSI_OVERBOUGHT and bearish_cross and vol_ok and hmm_bear_ok:
         sl = round(price + ATR_SL_MULT * volatility, 4)
         tp = round(max(price - ATR_SL_MULT * volatility * RR_RATIO, 0.0001), 4)
         return {
@@ -271,6 +398,10 @@ def generate_signal(ticker: str, price: float, volume: int) -> dict | None:
             "ema21": ema21,
             "volatility": volatility,
             "vol_ratio": (volume / avg_vol if avg_vol > 0 else 1),
+            "hmm_state": hmm_regime["state"],
+            "hmm_confidence": hmm_regime["confidence"],
+            "hmm_bull_prob": hmm_regime["bull_prob"],
+            "hmm_bear_prob": hmm_regime["bear_prob"],
         }
 
     return None
@@ -306,6 +437,10 @@ def build_signal_msg(ticker: str, sig: dict) -> str:
         f"📏 Volatility: GHS {sig['volatility']:.4f}
 "
         f"💧 Volume:  {sig['vol_ratio']:.1f}× average
+"
+        f"🧠 HMM Regime: {sig['hmm_state']} ({sig['hmm_confidence'] * 100:.0f}% confidence)
+"
+        f"🟢 Bull Prob: {sig['hmm_bull_prob'] * 100:.0f}% | 🔴 Bear Prob: {sig['hmm_bear_prob'] * 100:.0f}%
 "
         f"{'─' * 30}
 "

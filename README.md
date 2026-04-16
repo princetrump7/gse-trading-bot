@@ -4,7 +4,7 @@ This bot scans a GSE watchlist for swing trading signals based on a combination 
 
 ## How It Works
 
-The bot fetches live market data, analyzes it using RSI, EMA, and close-to-close volatility, and sends potential `BUY` or `SELL` signals to a specified Telegram channel.
+The bot fetches live market data, analyzes it using RSI, EMA, close-to-close volatility, and a lightweight Hidden Markov Model (HMM) regime filter, then sends potential `BUY` or `SELL` signals to a specified Telegram channel.
 
 - **Strategy**: Swing trading
 - **Indicators**:
@@ -12,6 +12,7 @@ The bot fetches live market data, analyzes it using RSI, EMA, and close-to-close
   - EMA-9 / EMA-21 crossover
   - 14-period close-to-close volatility for Stop Loss/Take Profit sizing
   - Volume confirmation
+  - Two-state HMM regime confirmation
 - **Execution**: Runs every 10 minutes via GitHub Actions on weekdays.
 - **Scope**: Only scans the configured watchlist.
 
@@ -33,9 +34,11 @@ The bot fetches live market data, analyzes it using RSI, EMA, and close-to-close
         -   `MIN_VOLUME`: Minimum live volume required before a signal can trigger.
         -   `ALERT_COOLDOWN_MINUTES`: Cooldown window for repeated same-direction alerts on a ticker.
         -   `MAX_HISTORY`: Maximum number of stored price/volume points per ticker.
+        -   `HMM_MIN_HISTORY`: Minimum history length required before HMM confirmation is active.
+        -   `HMM_CONFIDENCE_THRESHOLD`: Minimum regime probability required for bullish or bearish HMM confirmation.
 
 3.  **Enable GitHub Actions:**
-    -   Ensure that GitHub Actions are enabled for your repository. The workflow in `.github/workflows/run-bot.yml` will automatically start running on its schedule.
+    -   Ensure that GitHub Actions are enabled for your repository. The workflow in `.github/workflows/gse-bot.yml` will automatically start running on its schedule.
 
 ## How State is Managed
 
