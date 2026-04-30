@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       debug:
-        description: 'Enable debug logging'
+        description: 'Enable debug logging (BOT_DEBUG=1)'
         required: false
         default: false
         type: boolean
@@ -54,8 +54,14 @@ jobs:
         run: pip install --quiet -r requirements.txt
 
       # ── 4. Bot state cache ───────────────────────────────────────────────────
-      - name: Set TODAY env var
-        run: echo "TODAY=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+      # Save key is unique per run (immutable cache); restore-keys find the latest
+      # state for this OS / date.
+      - name: Set TODAY env var (WAT = UTC+0)
+        id: today
+        run: |
+          TODAY=$(date -u +%Y-%m-%d)
+          echo "TODAY=$TODAY" >> "$GITHUB_ENV"
+          echo "today=$TODAY" >> "$GITHUB_OUTPUT"
 
       - name: Restore bot state cache
         uses: actions/cache@v4
@@ -64,8 +70,9 @@ jobs:
             history.json
             volume.json
             alert_state.json
-          key: gse-state-${{ runner.os }}-${{ env.TODAY }}
+          key: gse-state-${{ runner.os }}-${{ steps.today.outputs.today }}-${{ github.run_id }}
           restore-keys: |
+            gse-state-${{ runner.os }}-${{ steps.today.outputs.today }}-
             gse-state-${{ runner.os }}-
 
       # ── 5. Run scan ──────────────────────────────────────────────────────────
@@ -75,7 +82,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           PYTHONUNBUFFERED: '1'
-          BOT_DEBUG: ${{ inputs.debug && '1' || '0' }}
+          BOT_DEBUG: ${{ github.event_name == 'workflow_dispatch' && inputs.debug && '1' || '0' }}
 
       - name: Upload bot state artifact
         if: always()

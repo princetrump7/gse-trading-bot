@@ -416,36 +416,21 @@ def build_signal_msg(ticker: str, sig: dict) -> str:
     tp_pct = abs(sig["tp"] - sig["entry"]) / sig["entry"] * 100 if sig["entry"] > 0 else 0
 
     return (
-        f"{SIGNAL_EMOJI[s]} *{s} SIGNAL — {ticker}*{wl_tag}
-"
-        f"{'─' * 30}
-"
-        f"📌 Entry:       *GHS {sig['entry']:.4f}*
-"
-        f"🛑 Stop Loss:   *GHS {sig['sl']:.4f}*  (-{sl_pct:.2f}%)
-"
-        f"🎯 Take Profit: *GHS {sig['tp']:.4f}*  (+{tp_pct:.2f}%)
-"
-        f"{'─' * 30}
-"
-        f"📊 RSI-14:  {sig['rsi']:.1f}
-"
-        f"📈 EMA-9:   GHS {sig['ema9']:.4f}
-"
-        f"📉 EMA-21:  GHS {sig['ema21']:.4f}
-"
-        f"📏 Volatility: GHS {sig['volatility']:.4f}
-"
-        f"💧 Volume:  {sig['vol_ratio']:.1f}× average
-"
-        f"🧠 HMM Regime: {sig['hmm_state']} ({sig['hmm_confidence'] * 100:.0f}% confidence)
-"
-        f"🟢 Bull Prob: {sig['hmm_bull_prob'] * 100:.0f}% | 🔴 Bear Prob: {sig['hmm_bear_prob'] * 100:.0f}%
-"
-        f"{'─' * 30}
-"
-        f"⚖️ {rr_label}  |  Swing trade
-"
+        f"{SIGNAL_EMOJI[s]} *{s} SIGNAL — {ticker}*{wl_tag}\n"
+        f"{'─' * 30}\n"
+        f"📌 Entry:       *GHS {sig['entry']:.4f}*\n"
+        f"🛑 Stop Loss:   *GHS {sig['sl']:.4f}*  (-{sl_pct:.2f}%)\n"
+        f"🎯 Take Profit: *GHS {sig['tp']:.4f}*  (+{tp_pct:.2f}%)\n"
+        f"{'─' * 30}\n"
+        f"📊 RSI-14:  {sig['rsi']:.1f}\n"
+        f"📈 EMA-9:   GHS {sig['ema9']:.4f}\n"
+        f"📉 EMA-21:  GHS {sig['ema21']:.4f}\n"
+        f"📏 Volatility: GHS {sig['volatility']:.4f}\n"
+        f"💧 Volume:  {sig['vol_ratio']:.1f}× average\n"
+        f"🧠 HMM Regime: {sig['hmm_state']} ({sig['hmm_confidence'] * 100:.0f}% confidence)\n"
+        f"🟢 Bull Prob: {sig['hmm_bull_prob'] * 100:.0f}% | 🔴 Bear Prob: {sig['hmm_bear_prob'] * 100:.0f}%\n"
+        f"{'─' * 30}\n"
+        f"⚖️ {rr_label}  |  Swing trade\n"
         f"⚠️ _Always manage your risk._"
     )
 
